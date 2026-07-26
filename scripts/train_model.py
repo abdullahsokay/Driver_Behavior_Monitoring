@@ -1,84 +1,166 @@
-"""Phase 1 - transfer learning with a FROZEN MobileNetV2 base.
-
-Trains only a small classification head on top of ImageNet features, using the
-leakage-free split from prepare_split.py (train/val are separated by driver,
-photo-burst and frame-block, so validation accuracy reflects real generalisation
-- not memorised near-duplicate frames).
-
-Prerequisite:  python scripts/prepare_split.py
-Note: on a GPU this is fast. On CPU-only TensorFlow it is slow because every
-epoch runs full images through MobileNetV2 - use scripts/train_fast_cpu.py for a
-quick CPU run that caches features instead.
-
-Output: models/driver_model.keras, models/class_indices.json
-"""
-
-print("Phase 1: training started")
+print("Script started successfully")
 import os
 import json
+import numpy as np
+import cv2
 import tensorflow as tf
-from tensorflow.keras import layers, models
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.applications import MobileNetV2
+from tensorflow.keras import layers, models
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
 
-import data_pipeline as dp
-
-# Reproducibility
-SEED = 42
-tf.keras.utils.set_random_seed(SEED)
-
+# Ensure we always run relative to the project root
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(script_dir)
 os.chdir(project_root)
 
+# ========================
+# 1️⃣ Paths and Parameters
+# ========================
+
+dataset_path = "dataset/train/imgs/train"  # Folder with class subfolders c0-c10
 model_save_path = "models/driver_model.keras"
 class_indices_path = "models/class_indices.json"
 
-img_height = img_width = dp.IMG   # 224
+img_height, img_width = 224, 224  # Input size for MobileNetV2
 batch_size = 32
-epochs = 15
+num_classes = 11
+epochs = 10
 
-os.makedirs("models", exist_ok=True)
+# ========================
+# 1.5️⃣ Blur augmentation
+# ========================
+# Randomly softens ~50% of training images. This stops the model from being
+# able to use raw sharpness/resolution/compression artifacts as a shortcut
+# for telling classes apart (which is what was happening: c10 images came
+# from a different, sharper source than c0-c9, so the model learned "sharp
+# close-up" == Drowsy instead of learning actual behaviour cues).
+def blur_augment(img):
+    if np.random.rand() < 0.5:
+        img_uint8 = np.clip(img, 0, 255).astype(np.uint8)
+        ksize = int(np.random.choice([3, 5]))
+        img_uint8 = cv2.GaussianBlur(img_uint8, (ksize, ksize), 0)
+        img = img_uint8.astype(np.float32)
+    return img
 
-# ---- classes & datasets from the leakage-free split ----
-classes = dp.get_classes()                       # ['c0','c1','c10','c2',...,'c9']
-class_to_idx = {c: i for i, c in enumerate(classes)}
-num_classes = len(classes)
+# ========================
+# 2️⃣ Check if paths exist
+# ========================
+
+if not os.path.exists(dataset_path):
+    raise FileNotFoundError(f"Dataset folder not found at {dataset_path}")
+
+if not os.path.exists("models"):
+    os.makedirs("models")
+
+# ========================
+# 3️⃣ Image Preprocessing
+# ========================
+
+# Create ImageDataGenerator with validation split
+datagen = ImageDataGenerator(
+    rescale=1./255,
+    validation_split=0.2,  # 20% validation
+    rotation_range=10,
+    zoom_range=0.1,
+    width_shift_range=0.1,
+    height_shift_range=0.1,
+    horizontal_flip=True,
+    preprocessing_function=blur_augment,  # runs on 0-255 range, before rescale
+)
+
+# Training generator
+train_data = datagen.flow_from_directory(
+    dataset_path,
+    target_size=(img_height, img_width),
+    batch_size=batch_size,
+    subset='training',
+    class_mode='categorical'
+)
+
+# Validation generator
+val_data = datagen.flow_from_directory(
+    dataset_path,
+    target_size=(img_height, img_width),
+    batch_size=batch_size,
+    subset='validation',
+    class_mode='categorical'
+)
+
+# Save class index mapping (folder name -> numeric index assigned by Keras)
+# This lets test_model.py and realtime_detect.py reverse-map predictions correctly,
+# even though Keras sorts folders alphabetically (c0, c1, c10, c2, ...).
 with open(class_indices_path, "w") as f:
-    json.dump(class_to_idx, f, indent=2)
-print(f"Classes ({num_classes}): {class_to_idx}")
+    json.dump(train_data.class_indices, f, indent=2)
+print(f"Class indices saved: {train_data.class_indices}")
 
-train_ds, n_train = dp.make_dataset(
-    "train", class_to_idx, batch=batch_size, shuffle=True,
-    augmenter=dp.make_augmenter(SEED), seed=SEED)
-val_ds, n_val = dp.make_dataset(
-    "val", class_to_idx, batch=batch_size, shuffle=False)
-print(f"Train images: {n_train}  |  Val images: {n_val}")
+# ========================
+# 4️⃣ Load MobileNetV2 Base Model
+# ========================
 
-# ---- frozen MobileNetV2 base + custom head ----
-base_model = MobileNetV2(weights="imagenet", include_top=False,
-                         input_shape=(img_height, img_width, 3))
-base_model.trainable = False
+base_model = MobileNetV2(weights='imagenet', include_top=False, input_shape=(img_height, img_width, 3))
 
-x = layers.GlobalAveragePooling2D()(base_model.output)
-x = layers.Dense(128, activation="relu")(x)
-x = layers.Dropout(0.4)(x)                        # regularise -> reduce overfit
-output = layers.Dense(num_classes, activation="softmax")(x)
+# Freeze the base model
+for layer in base_model.layers:
+    layer.trainable = False
+
+# ========================
+# 5️⃣ Build Custom Model
+# ========================
+
+x = base_model.output
+x = layers.GlobalAveragePooling2D()(x)
+x = layers.Dense(128, activation='relu')(x)
+output = layers.Dense(num_classes, activation='softmax')(x)
+
 model = models.Model(inputs=base_model.input, outputs=output)
 
-model.compile(optimizer="adam", loss="categorical_crossentropy",
-              metrics=["accuracy"])
-model.summary()
+# ========================
+# 6️⃣ Compile Model
+# ========================
 
-callbacks = [
-    ModelCheckpoint(model_save_path, monitor="val_accuracy",
-                    save_best_only=True, verbose=1),
-    EarlyStopping(monitor="val_accuracy", patience=4,
-                  restore_best_weights=True, verbose=1),
-]
+model.compile(
+    optimizer='adam',
+    loss='categorical_crossentropy',
+    metrics=['accuracy']
+)
 
-model.fit(train_ds, validation_data=val_ds, epochs=epochs, callbacks=callbacks)
+model.summary()  # Optional: prints model architecture
+
+# ========================
+# 7️⃣ Callbacks
+# ========================
+
+checkpoint = ModelCheckpoint(
+    model_save_path,
+    monitor='val_accuracy',
+    save_best_only=True,
+    verbose=1
+)
+
+early_stop = EarlyStopping(
+    monitor='val_accuracy',
+    patience=3,
+    verbose=1,
+    restore_best_weights=True
+)
+
+callbacks = [checkpoint, early_stop]
+
+# ========================
+# 8️⃣ Train Model
+# ========================
+
+history = model.fit(
+    train_data,
+    validation_data=val_data,
+    epochs=epochs,
+    callbacks=callbacks
+)
+
+# ========================
+# 9️⃣ Save Final Model (if not already saved by checkpoint)
+# ========================
 
 model.save(model_save_path)
 print(f"Model saved at {model_save_path}")
-print("Next: python scripts/finetune_model.py  (or evaluate with test_model.py)")

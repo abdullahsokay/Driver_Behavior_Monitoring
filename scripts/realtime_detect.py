@@ -17,15 +17,10 @@ os.chdir(project_root)
 # Paths and Parameters
 # ========================
 
-# Prefer the harmonised model (v3), then v2, then fine-tuned, then Phase 1.
-_model_candidates = [
-    "models/driver_model_v3.keras",         # harmonised + regularised (best)
-    "models/driver_model_v2.keras",         # leakage-free split
-    "models/driver_model_finetuned.keras",
-    "models/driver_model.keras",
-]
-model_path = next((p for p in _model_candidates if os.path.exists(p)),
-                  "models/driver_model.keras")
+# Use fine-tuned model if available, otherwise fall back to Phase 1 model
+finetuned_path = "models/driver_model_finetuned.keras"
+phase1_path = "models/driver_model.keras"
+model_path = finetuned_path if os.path.exists(finetuned_path) else phase1_path
 class_indices_path = "models/class_indices.json"
 img_height, img_width = 224, 224
 
@@ -34,6 +29,41 @@ confidence_threshold = 0.60
 
 # Temporal smoothing: average predictions over the last N frames to reduce flicker
 smoothing_window = 5
+
+# Drowsy is enabled, but GATED: it is only accepted as the prediction when the
+# model is at least this confident about it. Below this bar, drowsy is ignored and
+# the best of the OTHER behaviours is shown - so drowsy no longer covers everything
+# while still firing for a genuinely drowsy driver.
+# Raise drowsy_min_confidence -> drowsy fires less;  lower it -> fires more easily.
+# (Set skip_drowsy = True to disable drowsy completely again.)
+skip_drowsy = False
+drowsy_min_confidence = 0.97
+
+# Sustained-detection: how many consecutive smoothed frames must agree on the
+# SAME class before we fire an alert for it. Different severities get different
+# bars — "critical" (drowsy) requires the longest sustained run, since a single
+# blink or head-turn shouldn't trigger it, but a genuinely nodding-off driver will
+# hold that prediction for many consecutive frames.
+required_consecutive_frames = {
+    "critical": 8,
+    "high": 3,
+    "medium": 3,
+    "low": 3,
+}
+
+# ========================
+# Resolution normalization (MUST match train_model.py / finetune_model.py
+# exactly - this is what stops the model from using "this looks sharper/
+# lower-res than what I was trained on" as a Drowsy shortcut)
+# ========================
+NORM_SIZE = (320, 240)
+
+def normalize_resolution(img):
+    h, w = img.shape[:2]
+    img = cv2.resize(img, NORM_SIZE, interpolation=cv2.INTER_LINEAR)
+    img = cv2.GaussianBlur(img, (3, 3), 0)
+    img = cv2.resize(img, (w, h), interpolation=cv2.INTER_LINEAR)
+    return img
 
 # ========================
 # Firebase Configuration
@@ -48,8 +78,10 @@ tanker_id = "tanker_001"        # TODO: replace with the tanker this camera is m
 tanker_name = "TNK-001"         # TODO: replace with the tanker's display name
 alert_cooldown_seconds = 5  # don't fire the same behaviour alert more than once per N seconds
 
-# High-severity behaviours: phone use, texting, and drowsiness
-high_severity_codes = {"c1", "c2", "c3", "c4", "c10"}
+# Severity tiers. Drowsy (c10) is its own "critical" tier, separate from the
+# other high-severity distraction behaviours (phone use / texting).
+critical_severity_codes = {"c10"}
+high_severity_codes = {"c1", "c2", "c3", "c4"}
 medium_severity_codes = {"c5", "c6", "c8"}  # radio, drinking, hair/makeup
 
 # Map dataset folder names to human-readable behaviour labels
@@ -113,6 +145,8 @@ last_alert_time = {}  # {class_idx: last_sent_timestamp}
 
 
 def get_severity(behaviour_code):
+    if behaviour_code in critical_severity_codes:
+        return "critical"
     if behaviour_code in high_severity_codes:
         return "high"
     if behaviour_code in medium_severity_codes:
@@ -157,31 +191,10 @@ prediction_history = deque(maxlen=smoothing_window)
 # Reverse map: numeric idx -> folder code (e.g. 0 -> "c0")
 idx_to_code = {idx: code for code, idx in class_indices.items()}
 
-FONT = cv2.FONT_HERSHEY_SIMPLEX
-
-
-def draw_status_bar(frame, label, confidence, accent):
-    """Minimal, clean overlay: one translucent bottom bar with a status dot,
-    the behaviour label, and the confidence. Nothing else."""
-    h, w = frame.shape[:2]
-    bar_h = 64
-    cy = h - bar_h // 2
-
-    # translucent dark bar
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, h - bar_h), (w, h), (25, 25, 25), -1)
-    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
-
-    # coloured status dot
-    cv2.circle(frame, (30, cy), 10, accent, -1, cv2.LINE_AA)
-
-    # behaviour label (white)
-    cv2.putText(frame, label, (54, cy + 8), FONT, 0.9, (245, 245, 245), 2, cv2.LINE_AA)
-
-    # confidence, right-aligned, in the accent colour
-    conf_text = f"{confidence * 100:.0f}%"
-    (tw, _), _ = cv2.getTextSize(conf_text, FONT, 0.9, 2)
-    cv2.putText(frame, conf_text, (w - tw - 24, cy + 8), FONT, 0.9, accent, 2, cv2.LINE_AA)
+# Sustained-detection state: tracks how many consecutive smoothed frames
+# the CURRENT top class has held, so a single flickery frame can't fire an alert.
+consecutive_class_idx = None
+consecutive_count = 0
 
 while True:
     ret, frame = cap.read()
@@ -189,42 +202,85 @@ while True:
         print("Failed to grab frame.")
         break
 
-    # Preprocess frame for prediction. Two things must match training exactly:
-    #  1) colour order: the model was trained on RGB, but OpenCV frames are BGR.
-    #  2) per-image standardisation (same as data_pipeline.py / the v3 model).
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    img = cv2.resize(rgb, (img_width, img_height)).astype(np.float32)
-    mean = img.mean()
-    std = max(img.std(), 1.0 / np.sqrt(img.size))   # tf.image.per_image_standardization
-    img_array = np.expand_dims((img - mean) / std, axis=0)
+    # Preprocess frame for prediction.
+    # IMPORTANT: cv2 reads frames as BGR, but the training data was loaded via
+    # Keras' ImageDataGenerator (PIL), which reads images as RGB. Feeding BGR
+    # frames into a model trained on RGB is a consistent color-channel mismatch
+    # that biases predictions toward whichever class's features best match the
+    # inverted colors — this is what was causing "Drowsy" to dominate regardless
+    # of actual behaviour. Converting to RGB here fixes that mismatch.
+    img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    img = normalize_resolution(img)
+    img = cv2.resize(img, (img_width, img_height))
+    img_array = img / 255.0
+    img_array = np.expand_dims(img_array, axis=0)
 
     # Predict and apply temporal smoothing
     predictions = model.predict(img_array, verbose=0)[0]
     prediction_history.append(predictions)
     smoothed = np.mean(prediction_history, axis=0)
 
+    # Gate drowsy: only let it win when it is genuinely confident, otherwise
+    # suppress it so a frontal face isn't labelled Drowsy over every other class.
+    if "c10" in class_indices:
+        c10_idx = class_indices["c10"]
+        drowsy_confident = smoothed[c10_idx] >= drowsy_min_confidence
+        if skip_drowsy or not drowsy_confident:
+            smoothed = smoothed.copy()
+            smoothed[c10_idx] = 0.0
+            total = smoothed.sum()
+            if total > 0:
+                smoothed = smoothed / total   # renormalise over the remaining classes
+
     class_idx = int(np.argmax(smoothed))
     confidence = float(smoothed[class_idx])
+
+    # Track how many consecutive frames this class has been the top prediction
+    # (above threshold). Any change of class, or dropping below threshold,
+    # resets the streak.
+    if confidence >= confidence_threshold and class_idx == consecutive_class_idx:
+        consecutive_count += 1
+    elif confidence >= confidence_threshold:
+        consecutive_class_idx = class_idx
+        consecutive_count = 1
+    else:
+        consecutive_class_idx = None
+        consecutive_count = 0
 
     # Apply confidence threshold
     if confidence < confidence_threshold:
         label = "Uncertain"
-        accent = (0, 190, 235)   # amber (BGR)
+        color = (0, 255, 255)  # Yellow for uncertain
     else:
         label = class_labels[class_idx]
         if class_idx == safe_idx:
-            accent = (90, 200, 90)   # green
+            color = (0, 255, 0)  # Green for safe driving
         else:
-            accent = (60, 60, 235)   # red
+            color = (0, 0, 255)  # Red for distracted behavior
 
-            # Push alert to Firebase (with cooldown to avoid spamming)
-            now = time.time()
-            if now - last_alert_time.get(class_idx, 0) >= alert_cooldown_seconds:
-                last_alert_time[class_idx] = now
-                send_alert(label, idx_to_code[class_idx], confidence)
+            behaviour_code = idx_to_code[class_idx]
+            severity = get_severity(behaviour_code)
+            needed = required_consecutive_frames.get(severity, 3)
 
-    # Minimal overlay: one clean status line + confidence
-    draw_status_bar(frame, label, confidence, accent)
+            # Only alert once the behaviour has been sustained for long enough
+            # (critical/drowsy needs the longest sustained run) AND we're past
+            # the per-class cooldown, so alerts don't spam.
+            if consecutive_count >= needed:
+                now = time.time()
+                if now - last_alert_time.get(class_idx, 0) >= alert_cooldown_seconds:
+                    last_alert_time[class_idx] = now
+                    send_alert(label, behaviour_code, confidence)
+
+    # Display main prediction
+    text = f"{label} ({confidence*100:.1f}%)"
+    cv2.putText(frame, text, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+
+    # Display top-2 predictions in bright white for visibility
+    top2_idx = np.argsort(smoothed)[-2:][::-1]
+    cv2.putText(frame, "Top-2:", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    for i, idx in enumerate(top2_idx):
+        debug_text = f"{i+1}. {class_labels[idx]}: {smoothed[idx]*100:.1f}%"
+        cv2.putText(frame, debug_text, (10, 120 + i * 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
 
     # Show frame
     cv2.imshow("Driver Behavior Detection", frame)
